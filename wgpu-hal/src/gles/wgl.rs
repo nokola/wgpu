@@ -79,6 +79,15 @@ impl AdapterContext {
         AdapterContextLock { inner }
     }
 
+    /// FanRust patch: the EGL context's frame hold (egl.rs
+    /// `AdapterContext::hold_current`) has no WGL twin; nothing is held.
+    pub fn hold_current(&self) -> bool {
+        false
+    }
+
+    /// FanRust patch: see `hold_current`; nothing to release.
+    pub fn release_current(&self) {}
+
     /// Obtain a lock to the WGL context and get handle to the [`glow::Context`] that can be used to
     /// do rendering.
     ///

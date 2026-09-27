@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use glow::HasContext;
 use hashbrown::HashMap;
-use parking_lot::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
+use parking_lot::{Condvar, MappedMutexGuard, Mutex, MutexGuard, RwLock};
 
 /// The amount of time to wait while trying to obtain a lock to the adapter context
 const CONTEXT_LOCK_TIMEOUT_SECS: u64 = 6;
@@ -197,6 +197,12 @@ impl EglContext {
 pub struct AdapterContext {
     glow: Mutex<ManuallyDrop<glow::Context>>,
     egl: Option<EglContext>,
+    /// FanRust patch: the thread that keeps the context current across its
+    /// calls (`hold_current`), as its `hold_token`, if any. Changed with
+    /// `glow` locked.
+    held_by: Mutex<Option<u64>>,
+    /// Signalled when a hold ends (`release_current`).
+    hold_ended: Condvar,
 }
 
 unsafe impl Sync for AdapterContext {}
@@ -261,6 +267,19 @@ impl Drop for AdapterContext {
     }
 }
 
+/// FanRust patch: this thread's identity for `AdapterContext::hold_current`,
+/// or `None` while the thread's locals are torn down (a GL object dropped
+/// from a thread-local's destructor): such a thread never holds the
+/// context and waits like any other. Not `std::thread::current()`, which
+/// is not promised to work at that point.
+fn hold_token() -> Option<u64> {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    std::thread_local! {
+        static TOKEN: u64 = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    TOKEN.try_with(|t| *t).ok()
+}
+
 struct EglContextLock<'a> {
     instance: &'a Arc<EglInstance>,
     display: khronos_egl::Display,
@@ -303,25 +322,84 @@ impl AdapterContext {
     ///
     /// > **Note:** Calling this function **will** still lock the [`glow::Context`] which adds an
     /// > extra safe-guard against accidental concurrent access to the context.
+    ///
+    /// FanRust patch: waits, like `lock`, while another thread holds the
+    /// context (`hold_current`) — present makes it current on this thread.
     pub unsafe fn get_without_egl_lock(&self) -> MappedMutexGuard<'_, glow::Context> {
-        let guard = self
-            .glow
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
-            .expect("Could not lock adapter context. This is most-likely a deadlock.");
+        let (guard, _) = self.lock_glow();
         MutexGuard::map(guard, |glow| &mut **glow)
+    }
+
+    /// FanRust patch: locks `glow` once no other thread holds the context
+    /// (`hold_current`); the flag says whether this thread holds it.
+    #[track_caller]
+    fn lock_glow(&self) -> (MutexGuard<'_, ManuallyDrop<glow::Context>>, bool) {
+        let me = hold_token();
+        loop {
+            let glow = self
+                .glow
+                // Don't lock forever. If it takes longer than 1 second to get the lock we've got a
+                // deadlock and should panic to show where we got stuck
+                .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+                .expect("Could not lock adapter context. This is most-likely a deadlock.");
+            let holder = *self.held_by.lock();
+            match holder {
+                None => return (glow, false),
+                Some(t) if Some(t) == me => return (glow, true),
+                Some(_) => {}
+            }
+            // Current on the holding thread, so EGL would refuse it here.
+            drop(glow);
+            self.wait_for_hold_end(me);
+        }
+    }
+
+    /// FanRust patch: blocks until no thread but this one holds the context.
+    /// Logs once after 250 ms (a hold is meant to last one frame) and panics
+    /// after `CONTEXT_LOCK_TIMEOUT_SECS`, as a stuck `glow` lock does.
+    #[track_caller]
+    fn wait_for_hold_end(&self, me: Option<u64>) {
+        const STEP_MS: u64 = 250;
+        let mut waited_ms: u64 = 0;
+        let mut held = self.held_by.lock();
+        while held.is_some_and(|t| Some(t) != me) {
+            if self
+                .hold_ended
+                .wait_for(&mut held, Duration::from_millis(STEP_MS))
+                .timed_out()
+            {
+                waited_ms += STEP_MS;
+                if waited_ms == STEP_MS {
+                    log::warn!("wgpu-hal gles: a thread has waited {STEP_MS} ms for another thread's hold_current to end");
+                }
+                assert!(
+                    waited_ms < CONTEXT_LOCK_TIMEOUT_SECS * 1000,
+                    "Could not lock adapter context: another thread holds it current (hold_current). This is most-likely a deadlock."
+                );
+            }
+        }
     }
 
     /// Obtain a lock to the EGL context and get handle to the [`glow::Context`] that can be used to
     /// do rendering.
+    ///
+    /// FanRust patch: on the thread that holds the context (`hold_current`)
+    /// the context is already current and stays so: no make-current, no
+    /// release. Another thread waits until the hold ends.
     #[track_caller]
     pub fn lock<'a>(&'a self) -> AdapterContextLock<'a> {
-        let glow = self
-            .glow
-            // Don't lock forever. If it takes longer than 1 second to get the lock we've got a
-            // deadlock and should panic to show where we got stuck
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
-            .expect("Could not lock adapter context. This is most-likely a deadlock.");
-
+        let (glow, held_here) = self.lock_glow();
+        if held_here {
+            // Current since `hold_current` — unless something on this thread
+            // released it meanwhile (a failed present, a surface made or
+            // dropped): then it is made current again, once, and stays.
+            if let Some(egl) = self.egl.as_ref() {
+                if egl.instance.get_current_context() != Some(egl.raw) {
+                    egl.make_current();
+                }
+            }
+            return AdapterContextLock { glow, egl: None };
+        }
         let egl = self.egl.as_ref().map(|egl| {
             egl.make_current();
             EglContextLock {
@@ -329,8 +407,63 @@ impl AdapterContext {
                 display: egl.display,
             }
         });
-
         AdapterContextLock { glow, egl }
+    }
+
+    /// FanRust patch: makes the context current on this thread until
+    /// `release_current`, so every `lock` on this thread in between skips
+    /// its make-current and release. Returns false (nothing held) when
+    /// another thread holds it or there is no EGL context of our own.
+    ///
+    /// Needed because EGL flushes the context at every release: on the
+    /// OnePlus A0001 (Adreno 330) each `lock` cost two GPU jobs, and about
+    /// 7 of them ran per frame (FanRust docs/todo-perf-smudge.md PS33).
+    /// Hold it only while no other thread needs the context: a thread the
+    /// holder waits on would wait for the hold forever.
+    pub fn hold_current(&self) -> bool {
+        let Some(egl) = self.egl.as_ref() else {
+            return false;
+        };
+        let Some(me) = hold_token() else {
+            return false;
+        };
+        let _glow = self
+            .glow
+            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+            .expect("Could not lock adapter context. This is most-likely a deadlock.");
+        let mut held = self.held_by.lock();
+        if held.is_some() {
+            return false;
+        }
+        egl.make_current();
+        *held = Some(me);
+        true
+    }
+
+    /// FanRust patch: ends this thread's `hold_current` (nothing when this
+    /// thread holds nothing): the context is released and waiting threads
+    /// go on.
+    pub fn release_current(&self) {
+        let Some(egl) = self.egl.as_ref() else {
+            return;
+        };
+        let _glow = self
+            .glow
+            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+            .expect("Could not lock adapter context. This is most-likely a deadlock.");
+        let mut held = self.held_by.lock();
+        if held.is_none() || *held != hold_token() {
+            return;
+        }
+        egl.unmake_current();
+        *held = None;
+        self.hold_ended.notify_all();
+    }
+
+    /// FanRust patch: whether this thread holds the context (`hold_current`).
+    fn is_held_here(&self) -> bool {
+        let held = *self.held_by.lock();
+        held.is_some() && held == hold_token()
     }
 }
 
@@ -1033,6 +1166,8 @@ impl crate::Instance for Instance {
                     glow: Mutex::new(gl),
                     // ERROR: Copying owned reference handles here, be careful to not drop them!
                     egl: Some(inner.egl.clone()),
+                    held_by: Mutex::new(None),
+                    hold_ended: Condvar::new(),
                 },
                 self.options.clone(),
             )
@@ -1062,6 +1197,8 @@ impl super::Adapter {
                 AdapterContext {
                     glow: Mutex::new(ManuallyDrop::new(context)),
                     egl: None,
+                    held_by: Mutex::new(None),
+                    hold_ended: Condvar::new(),
                 },
                 options,
             )
@@ -1177,6 +1314,12 @@ impl Surface {
                 crate::SurfaceError::Lost
                 // TODO: should we unset the current context here?
             })?;
+        // FanRust patch: a held context (`AdapterContext::hold_current`)
+        // goes back to the context's own surface and stays current.
+        if context.is_held_here() {
+            self.egl.make_current();
+            return Ok(());
+        }
         self.egl
             .instance
             .make_current(self.egl.display, None, None, None)
