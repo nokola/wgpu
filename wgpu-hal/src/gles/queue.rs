@@ -1971,6 +1971,7 @@ impl crate::Queue for super::Queue {
         let shared = Arc::clone(&self.shared);
         let gl = &shared.context.lock();
         for (i, cmd_buf) in command_buffers.iter().enumerate() {
+            super::COMMAND_BUFFERS_REPLAYED.fetch_add(1, Ordering::Relaxed);
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
             // this at the beginning of the loop in case something outside of wgpu modified

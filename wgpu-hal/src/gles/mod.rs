@@ -354,6 +354,12 @@ struct CachedFramebuffer {
     draw_buffers: Option<u8>,
 }
 
+/// FanRust patch: the command buffers `Queue::submit` replayed, ever. The
+/// app's `GPU-JOBS` bench diffs it around each burst (wgpu-core records a
+/// render pass as two, which is what made a pass cost two extra GPU jobs on
+/// the OnePlus A0001 — `Queue::reset_state`).
+pub static COMMAND_BUFFERS_REPLAYED: AtomicU32 = AtomicU32::new(0);
+
 /// Framebuffers kept before the least recently used one is deleted. Past
 /// the cap every pass on a target not in the cache creates a framebuffer
 /// and deletes another, slower than the re-attach road, so the cap sits
