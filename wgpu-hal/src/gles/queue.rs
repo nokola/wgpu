@@ -85,9 +85,18 @@ impl super::Queue {
         }
     }
 
-    unsafe fn reset_state(&self, gl: &glow::Context) {
+    unsafe fn reset_state(&self, gl: &glow::Context, first_of_submit: bool) {
         unsafe { gl.use_program(None) };
-        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+        // FanRust patch: framebuffer 0 only at a submit's start (for state
+        // changed outside wgpu). wgpu-core records every render pass as two
+        // command buffers, and on the OnePlus A0001 (Adreno 330) each bind
+        // of framebuffer 0 ended a GPU job: an empty pass cost 2 jobs, a
+        // smudge stamp 3 (FanRust docs/todo-perf-smudge.md PS13). No command
+        // needs framebuffer 0 bound: a pass binds its own and a copy reads
+        // through `copy_fbo`.
+        if first_of_submit {
+            unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+        }
         unsafe { gl.disable(glow::DEPTH_TEST) };
         unsafe { gl.disable(glow::STENCIL_TEST) };
         unsafe { gl.disable(glow::SCISSOR_TEST) };
@@ -1918,12 +1927,12 @@ impl crate::Queue for super::Queue {
     ) -> Result<(), crate::DeviceError> {
         let shared = Arc::clone(&self.shared);
         let gl = &shared.context.lock();
-        for cmd_buf in command_buffers.iter() {
+        for (i, cmd_buf) in command_buffers.iter().enumerate() {
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
             // this at the beginning of the loop in case something outside of wgpu modified
             // this state prior to commit.
-            unsafe { self.reset_state(gl) };
+            unsafe { self.reset_state(gl, i == 0) };
             if let Some(ref label) = cmd_buf.label {
                 if self
                     .shared
