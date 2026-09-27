@@ -73,6 +73,9 @@ impl super::Queue {
         unsafe { gl.disable(glow::BLEND) };
         unsafe { gl.disable(glow::CULL_FACE) };
         unsafe { gl.draw_buffers(&[glow::COLOR_ATTACHMENT0 + draw_buffer]) };
+        // FanRust patch: the kept framebuffer's draw-buffer record is stale
+        // from here (`FramebufferCache::draw_buffers_already_set`).
+        self.shared.framebuffers.lock().forget_draw_buffers_of_bound();
         unsafe { gl.draw_arrays(glow::TRIANGLES, 0, 3) };
 
         let draw_buffer_count = self.draw_buffer_count.load(Ordering::Relaxed);
@@ -96,6 +99,7 @@ impl super::Queue {
         // through `copy_fbo`.
         if first_of_submit {
             unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+            self.shared.framebuffers.lock().forget_bound();
         }
         unsafe { gl.disable(glow::DEPTH_TEST) };
         unsafe { gl.disable(glow::STENCIL_TEST) };
@@ -1114,6 +1118,7 @@ impl super::Queue {
                 }
             }
             C::ResetFramebuffer { is_default } => {
+                self.shared.framebuffers.lock().forget_bound();
                 if is_default {
                     unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
                 } else {
@@ -1182,6 +1187,7 @@ impl super::Queue {
                 unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.draw_fbo)) };
                 unsafe { gl.read_buffer(attachment) };
                 unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.copy_fbo)) };
+                self.shared.framebuffers.lock().forget_bound();
                 unsafe {
                     self.set_attachment(
                         gl,
@@ -1220,10 +1226,12 @@ impl super::Queue {
             }
             C::SetDrawColorBuffers(count) => {
                 self.draw_buffer_count.store(count, Ordering::Relaxed);
-                let indices = (0..count as u32)
-                    .map(|i| glow::COLOR_ATTACHMENT0 + i)
-                    .collect::<ArrayVec<_, { crate::MAX_COLOR_ATTACHMENTS }>>();
-                unsafe { gl.draw_buffers(&indices) };
+                if !self.shared.framebuffers.lock().draw_buffers_already_set(count) {
+                    let indices = (0..count as u32)
+                        .map(|i| glow::COLOR_ATTACHMENT0 + i)
+                        .collect::<ArrayVec<_, { crate::MAX_COLOR_ATTACHMENTS }>>();
+                    unsafe { gl.draw_buffers(&indices) };
+                }
             }
             C::ClearColorF {
                 draw_buffer,

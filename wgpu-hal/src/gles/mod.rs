@@ -340,12 +340,18 @@ type FramebufferKey = ArrayVec<FramebufferTarget, { crate::MAX_COLOR_ATTACHMENTS
 struct FramebufferCache {
     entries: Vec<CachedFramebuffer>,
     clock: u64,
+    /// The cached framebuffer bound to `DRAW_FRAMEBUFFER` by `bind`, until
+    /// anything else binds one (`forget_bound`).
+    bound_entry: Option<usize>,
 }
 
 struct CachedFramebuffer {
     key: FramebufferKey,
     fbo: glow::Framebuffer,
     last_used: u64,
+    /// The draw-buffer count last set while this framebuffer was bound
+    /// (`glDrawBuffers` is framebuffer state in GLES 3).
+    draw_buffers: Option<u8>,
 }
 
 /// Framebuffers kept before the least recently used one is deleted. Past
@@ -364,6 +370,7 @@ impl FramebufferCache {
         if let Some(i) = self.entries.iter().position(|e| e.key == *key) {
             self.entries[i].last_used = clock;
             unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.entries[i].fbo)) };
+            self.bound_entry = Some(i);
             return;
         }
         if self.entries.len() >= FRAMEBUFFER_CACHE_CAP {
@@ -390,11 +397,43 @@ impl FramebufferCache {
             key: key.clone(),
             fbo,
             last_used: clock,
+            draw_buffers: None,
         });
+        self.bound_entry = Some(self.entries.len() - 1);
+    }
+
+    /// Something other than `bind` changed the draw framebuffer binding.
+    fn forget_bound(&mut self) {
+        self.bound_entry = None;
+    }
+
+    /// Whether `glDrawBuffers(count)` can be skipped: the bound cached
+    /// framebuffer already has `count`. Records `count` as set otherwise.
+    ///
+    /// Needed because wgpu sets it at every pass, and on the OnePlus A0001
+    /// (Adreno 330) that cost a pass one more GPU job (FanRust
+    /// docs/todo-perf-smudge.md PS13).
+    fn draw_buffers_already_set(&mut self, count: u8) -> bool {
+        let Some(i) = self.bound_entry else { return false };
+        if self.entries[i].draw_buffers == Some(count) {
+            return true;
+        }
+        self.entries[i].draw_buffers = Some(count);
+        false
+    }
+
+    /// Something other than `SetDrawColorBuffers` set `glDrawBuffers` on
+    /// the bound framebuffer (the Mesa shader-clear workaround): its record
+    /// no longer tells.
+    fn forget_draw_buffers_of_bound(&mut self) {
+        if let Some(i) = self.bound_entry {
+            self.entries[i].draw_buffers = None;
+        }
     }
 
     /// Deletes every framebuffer that names `texture`.
     unsafe fn forget_texture(&mut self, gl: &glow::Context, texture: glow::Texture) {
+        self.bound_entry = None;
         self.entries.retain(|e| {
             let names = e.key.iter().any(|t| t.texture == texture);
             if names {
@@ -406,6 +445,7 @@ impl FramebufferCache {
 
     /// Deletes every kept framebuffer.
     unsafe fn clear(&mut self, gl: &glow::Context) {
+        self.bound_entry = None;
         for e in self.entries.drain(..) {
             unsafe { gl.delete_framebuffer(e.fbo) };
         }
