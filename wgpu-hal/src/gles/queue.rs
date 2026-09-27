@@ -25,6 +25,33 @@ fn to_debug_str(s: &str) -> &str {
     }
 }
 
+/// FanRust patch: enables vertex attribute `location` on the bound vertex
+/// array, reading `buffer`'s first vec4 for every vertex and instance (a
+/// divisor no instance count reaches). Leaves no `ARRAY_BUFFER` bound.
+///
+/// Needed because a draw with no enabled attribute array — every FanRust
+/// draw builds its quad from the vertex index — makes the OnePlus A0001's
+/// Adreno driver write "No vertex attrib is enabled in a draw call!" to
+/// the log, 25-40 lines a frame from the drawing thread (FanRust
+/// docs/todo-perf-smudge.md PS34). Set at device open on the last location
+/// and again whenever a pipeline that used that location lets go of it
+/// (`C::UnsetVertexAttribute`), so a pipeline may use every location.
+///
+/// On GLES 3.1+ `glVertexAttribPointer` also points vertex buffer binding
+/// `location` at `buffer`; wgpu binds a pipeline's vertex buffers again in
+/// every pass that uses them, so nothing reads the replaced binding.
+pub(super) unsafe fn enable_spare_vertex_attribute(
+    gl: &glow::Context,
+    buffer: glow::Buffer,
+    location: u32,
+) {
+    unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer)) };
+    unsafe { gl.vertex_attrib_pointer_f32(location, 4, glow::FLOAT, false, 0, 0) };
+    unsafe { gl.vertex_attrib_divisor(location, u32::MAX) };
+    unsafe { gl.enable_vertex_attrib_array(location) };
+    unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, None) };
+}
+
 pub(super) fn get_2d_target(target: u32, array_layer: u32) -> u32 {
     const CUBEMAP_FACES: [u32; 6] = [
         glow::TEXTURE_CUBE_MAP_POSITIVE_X,
@@ -1432,7 +1459,15 @@ impl super::Queue {
                 }
             }
             C::UnsetVertexAttribute(location) => {
-                unsafe { gl.disable_vertex_attrib_array(location) };
+                if location == self.spare_vertex_attribute {
+                    // FanRust patch: a pipeline used the spare location;
+                    // it goes back to the always-enabled array.
+                    unsafe {
+                        enable_spare_vertex_attribute(gl, self.zero_buffer, location)
+                    };
+                } else {
+                    unsafe { gl.disable_vertex_attrib_array(location) };
+                }
             }
             C::SetVertexBuffer {
                 index,

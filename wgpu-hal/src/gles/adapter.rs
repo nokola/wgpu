@@ -1096,6 +1096,15 @@ impl crate::Adapter for super::Adapter {
         let zeroes = vec![0u8; super::ZERO_BUFFER_SIZE];
         unsafe { gl.buffer_data_u8_slice(glow::COPY_READ_BUFFER, &zeroes, glow::STATIC_DRAW) };
 
+        // FanRust patch: one vertex attribute array always enabled on the
+        // one vertex array wgpu uses (`queue::enable_spare_vertex_attribute`
+        // has the why), at the last location. GLES 3.0 guarantees 16.
+        let spare_vertex_attribute =
+            (unsafe { gl.get_parameter_i32(glow::MAX_VERTEX_ATTRIBS) }.max(1) - 1) as u32;
+        unsafe {
+            super::queue::enable_spare_vertex_attribute(gl, zero_buffer, spare_vertex_attribute)
+        };
+
         // Compile the shader program we use for doing manual clears to work around Mesa fastclear
         // bug.
 
@@ -1133,6 +1142,7 @@ impl crate::Adapter for super::Adapter {
                 temp_query_results: Mutex::new(Vec::new()),
                 draw_buffer_count: AtomicU8::new(1),
                 current_index_buffer: Mutex::new(None),
+                spare_vertex_attribute,
             },
         })
     }

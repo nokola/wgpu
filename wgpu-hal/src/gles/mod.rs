@@ -524,6 +524,10 @@ pub struct Queue {
     temp_query_results: Mutex<Vec<u64>>,
     draw_buffer_count: AtomicU8,
     current_index_buffer: Mutex<Option<glow::Buffer>>,
+    /// FanRust patch: the vertex attribute location kept enabled on
+    /// `zero_buffer` between a pipeline's uses of it
+    /// (`queue::enable_spare_vertex_attribute`).
+    spare_vertex_attribute: u32,
 }
 
 impl Drop for Queue {
@@ -532,6 +536,9 @@ impl Drop for Queue {
         unsafe { self.shared.framebuffers.lock().clear(gl) };
         unsafe { gl.delete_framebuffer(self.draw_fbo) };
         unsafe { gl.delete_framebuffer(self.copy_fbo) };
+        // FanRust patch: the spare attribute reads `zero_buffer`; no enabled
+        // array may name a deleted buffer.
+        unsafe { gl.disable_vertex_attrib_array(self.spare_vertex_attribute) };
         unsafe { gl.delete_buffer(self.zero_buffer) };
     }
 }
