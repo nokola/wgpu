@@ -301,6 +301,115 @@ struct AdapterShared {
     /// Cached here so it doesn't need to be queried every time texture format capabilities are requested.
     /// (this has been shown to be a significant enough overhead)
     max_msaa_samples: i32,
+
+    /// FanRust patch: framebuffers kept per render target (see
+    /// `FramebufferCache`). Shared because the device deletes a texture's
+    /// framebuffers when it deletes the texture. Lock the GL context first.
+    framebuffers: Mutex<FramebufferCache>,
+}
+
+/// FanRust patch: one colour attachment of a cached framebuffer — a
+/// single-sample, single-layer, single-mip 2D texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FramebufferTarget {
+    attachment: u32,
+    texture: glow::Texture,
+    target: BindTarget,
+    mip: u32,
+    layer: u32,
+}
+
+/// FanRust patch: what a cached framebuffer has attached.
+type FramebufferKey = ArrayVec<FramebufferTarget, { crate::MAX_COLOR_ATTACHMENTS }>;
+
+/// FanRust patch: framebuffer objects kept per set of attachments, so a
+/// render pass binds one instead of re-attaching its target to the one
+/// shared `draw_fbo`.
+///
+/// Needed because the re-attach road detaches every attachment slot and
+/// re-attaches the target for every pass, and the driver re-checks the
+/// framebuffer each time: on the OnePlus A0001 (Adreno 330) a smudge stamp
+/// is one pass, and with this cache a smudge stroke drew 1.5x as many frames
+/// (the GPU jobs per stroke did not change; FanRust
+/// docs/todo-perf-smudge.md PS13).
+///
+/// A GL name is reused once its object is deleted, so `Device::destroy_texture`
+/// deletes every framebuffer that names the texture before a new texture can
+/// take the name.
+#[derive(Default)]
+struct FramebufferCache {
+    entries: Vec<CachedFramebuffer>,
+    clock: u64,
+}
+
+struct CachedFramebuffer {
+    key: FramebufferKey,
+    fbo: glow::Framebuffer,
+    last_used: u64,
+}
+
+/// Framebuffers kept before the least recently used one is deleted. Past
+/// the cap every pass on a target not in the cache creates a framebuffer
+/// and deletes another, slower than the re-attach road, so the cap sits
+/// well above the render targets one frame of FanRust draws to (canvas
+/// sectors, mask tiles, smudge windows, scratches).
+const FRAMEBUFFER_CACHE_CAP: usize = 256;
+
+impl FramebufferCache {
+    /// The framebuffer for `key`, made on first use. Leaves it bound to
+    /// `DRAW_FRAMEBUFFER`.
+    unsafe fn bind(&mut self, gl: &glow::Context, key: &FramebufferKey) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(i) = self.entries.iter().position(|e| e.key == *key) {
+            self.entries[i].last_used = clock;
+            unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.entries[i].fbo)) };
+            return;
+        }
+        if self.entries.len() >= FRAMEBUFFER_CACHE_CAP {
+            let oldest = (0..self.entries.len())
+                .min_by_key(|&i| self.entries[i].last_used)
+                .expect("non-empty");
+            let evicted = self.entries.swap_remove(oldest);
+            unsafe { gl.delete_framebuffer(evicted.fbo) };
+        }
+        let fbo = unsafe { gl.create_framebuffer() }.expect("Could not create framebuffer");
+        unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo)) };
+        for t in key {
+            unsafe {
+                gl.framebuffer_texture_2d(
+                    glow::DRAW_FRAMEBUFFER,
+                    t.attachment,
+                    queue::get_2d_target(t.target, t.layer),
+                    Some(t.texture),
+                    t.mip as i32,
+                )
+            };
+        }
+        self.entries.push(CachedFramebuffer {
+            key: key.clone(),
+            fbo,
+            last_used: clock,
+        });
+    }
+
+    /// Deletes every framebuffer that names `texture`.
+    unsafe fn forget_texture(&mut self, gl: &glow::Context, texture: glow::Texture) {
+        self.entries.retain(|e| {
+            let names = e.key.iter().any(|t| t.texture == texture);
+            if names {
+                unsafe { gl.delete_framebuffer(e.fbo) };
+            }
+            !names
+        });
+    }
+
+    /// Deletes every kept framebuffer.
+    unsafe fn clear(&mut self, gl: &glow::Context) {
+        for e in self.entries.drain(..) {
+            unsafe { gl.delete_framebuffer(e.fbo) };
+        }
+    }
 }
 
 impl fmt::Debug for AdapterShared {
@@ -317,6 +426,7 @@ impl fmt::Debug for AdapterShared {
             program_cache: _,
             es,
             max_msaa_samples,
+            framebuffers: _,
         } = self;
         f.debug_struct("AdapterShared")
             .field("private_caps", private_caps)
@@ -379,6 +489,7 @@ pub struct Queue {
 impl Drop for Queue {
     fn drop(&mut self) {
         let gl = &self.shared.context.lock();
+        unsafe { self.shared.framebuffers.lock().clear(gl) };
         unsafe { gl.delete_framebuffer(self.draw_fbo) };
         unsafe { gl.delete_framebuffer(self.copy_fbo) };
         unsafe { gl.delete_buffer(self.zero_buffer) };
@@ -994,6 +1105,11 @@ enum Command {
     },
     ResetFramebuffer {
         is_default: bool,
+    },
+    /// FanRust patch: bind the kept framebuffer for these attachments
+    /// (`FramebufferCache`), then the same state reset as `ResetFramebuffer`.
+    BindCachedFramebuffer {
+        key: FramebufferKey,
     },
     BindAttachment {
         attachment: u32,

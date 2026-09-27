@@ -1104,6 +1104,14 @@ impl crate::Device for super::Device {
     }
 
     unsafe fn destroy_texture(&self, texture: super::Texture) {
+        if let super::TextureInner::Texture { raw, .. } = texture.inner {
+            // FanRust patch: a kept framebuffer must not outlive the name,
+            // or a later texture that reuses it would be drawn through the
+            // old attachment (`FramebufferCache`). Also for a texture wgpu
+            // does not own: its owner may delete the name after this.
+            let gl = &self.shared.context.lock();
+            unsafe { self.shared.framebuffers.lock().forget_texture(gl, raw) };
+        }
         if texture.drop_guard.is_none() {
             let gl = &self.shared.context.lock();
             match texture.inner {

@@ -25,7 +25,7 @@ fn to_debug_str(s: &str) -> &str {
     }
 }
 
-fn get_2d_target(target: u32, array_layer: u32) -> u32 {
+pub(super) fn get_2d_target(target: u32, array_layer: u32) -> u32 {
     const CUBEMAP_FACES: [u32; 6] = [
         glow::TEXTURE_CUBE_MAP_POSITIVE_X,
         glow::TEXTURE_CUBE_MAP_NEGATIVE_X,
@@ -1131,6 +1131,16 @@ impl super::Queue {
                         };
                     }
                 }
+                unsafe { gl.color_mask(true, true, true, true) };
+                unsafe { gl.depth_mask(true) };
+                unsafe { gl.stencil_mask(!0) };
+                unsafe { gl.disable(glow::DEPTH_TEST) };
+                unsafe { gl.disable(glow::STENCIL_TEST) };
+                unsafe { gl.disable(glow::SCISSOR_TEST) };
+            }
+            C::BindCachedFramebuffer { ref key } => {
+                unsafe { self.shared.framebuffers.lock().bind(gl, key) };
+                // The rest of `ResetFramebuffer`'s state reset.
                 unsafe { gl.color_mask(true, true, true, true) };
                 unsafe { gl.depth_mask(true) };
                 unsafe { gl.stencil_mask(!0) };

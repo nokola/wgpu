@@ -259,6 +259,47 @@ impl super::CommandEncoder {
     }
 }
 
+/// FanRust patch: the kept-framebuffer key of a pass whose attachments are
+/// all plain — colour only, single-sample, no resolve, each a single-mip,
+/// single-layer 2D texture. `None` for anything else, which keeps the
+/// original re-attach road (`super::FramebufferCache`).
+fn cached_framebuffer_key(
+    desc: &crate::RenderPassDescriptor<super::QuerySet, super::TextureView>,
+) -> Option<super::FramebufferKey> {
+    if desc.depth_stencil_attachment.is_some() || desc.sample_count != 1 {
+        return None;
+    }
+    let mut key = super::FramebufferKey::new();
+    for (i, cat) in desc.color_attachments.iter().enumerate() {
+        let Some(cat) = cat.as_ref() else { continue };
+        if cat.resolve_target.is_some() {
+            return None;
+        }
+        let view = &cat.target.view;
+        let super::TextureInner::Texture { raw, target } = view.inner else {
+            return None;
+        };
+        if conv::is_layered_target(target)
+            || view.mip_levels.len() != 1
+            || view.array_layers.len() != 1
+        {
+            return None;
+        }
+        key.push(super::FramebufferTarget {
+            attachment: glow::COLOR_ATTACHMENT0 + i as u32,
+            texture: raw,
+            target,
+            mip: view.mip_levels.start,
+            layer: view.array_layers.start,
+        });
+    }
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
 impl crate::CommandEncoder for super::CommandEncoder {
     type A = super::Api;
 
@@ -537,6 +578,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         // `COLOR_ATTACHMENT0` to `COLOR_ATTACHMENT31` gives 32 possible color attachments.
         assert!(desc.color_attachments.len() <= 32);
 
+        let mut cached_key = cached_framebuffer_key(desc);
         match desc
             .color_attachments
             .first()
@@ -548,6 +590,24 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 self.cmd_buffer
                     .commands
                     .push(C::ResetFramebuffer { is_default: true });
+            }
+            _ if cached_key.is_some() => {
+                // FanRust patch: bind the kept framebuffer for these
+                // attachments instead of re-attaching them to `draw_fbo`
+                // (`super::FramebufferCache`).
+                let key = cached_key.take().expect("checked above");
+                self.cmd_buffer
+                    .commands
+                    .push(C::BindCachedFramebuffer { key });
+                for (i, cat) in desc.color_attachments.iter().enumerate() {
+                    if let Some(cat) = cat.as_ref() {
+                        if cat.ops.contains(crate::AttachmentOps::STORE_DISCARD) {
+                            self.state
+                                .invalidate_attachments
+                                .push(glow::COLOR_ATTACHMENT0 + i as u32);
+                        }
+                    }
+                }
             }
             _ => {
                 // set the framebuffer
