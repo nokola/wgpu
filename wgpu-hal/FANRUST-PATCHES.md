@@ -94,6 +94,18 @@ pinned commit: an old FanRust release must still build.
 6. **A replay counter** (`mod.rs` `COMMAND_BUFFERS_REPLAYED`): command
    buffers `Queue::submit` replayed, read by FanRust's `GPU-JOBS` bench.
 
+7. **Present lets go of the context after a failed swap** (`egl.rs`
+   `Surface::present`). Upstream returned on a `swap_buffers` error with
+   the context still current on the presenting thread (its own `TODO`), so
+   the next thread to lock the context panicked on eglMakeCurrent's
+   `BadAccess`. Seen on the Redmi Note 13 (Adreno 610) and repeated on the
+   OnePlus A0001: leave the app during a cold start and come back while it
+   still boots; the first frames go to the destroyed window.
+   - Now the context is released (or, when held, returned to its own
+     surface) on both paths, and the swap's error is returned after.
+   - Re-check on a wgpu upgrade: every `?` / `return Err` in `present`
+     after its `make_current(surface)` goes through the same release.
+
 ## Checking after any change here or a wgpu upgrade
 
 All run in FanRust, with its `[patch.crates-io]` pointing at the new commit.

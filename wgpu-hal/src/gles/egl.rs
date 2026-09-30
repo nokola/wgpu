@@ -1306,19 +1306,23 @@ impl Surface {
 
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
-        self.egl
+        let swapped = self
+            .egl
             .instance
             .swap_buffers(self.egl.display, sc.surface)
             .map_err(|e| {
                 log::error!("swap_buffers failed: {e}");
                 crate::SurfaceError::Lost
-                // TODO: should we unset the current context here?
-            })?;
-        // FanRust patch: a held context (`AdapterContext::hold_current`)
-        // goes back to the context's own surface and stays current.
+            });
+        // FanRust patch: the context leaves the window's surface whether or
+        // not the swap worked. A failed swap (the window destroyed under
+        // the app) used to return with the context still current on this
+        // thread, and the next thread to lock it panicked on eglMakeCurrent's
+        // BadAccess. A held context (`AdapterContext::hold_current`) goes
+        // back to the context's own surface and stays current.
         if context.is_held_here() {
             self.egl.make_current();
-            return Ok(());
+            return swapped;
         }
         self.egl
             .instance
@@ -1328,7 +1332,7 @@ impl Surface {
                 crate::SurfaceError::Lost
             })?;
 
-        Ok(())
+        swapped
     }
 
     unsafe fn unconfigure_impl(
