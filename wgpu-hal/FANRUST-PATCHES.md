@@ -106,6 +106,31 @@ pinned commit: an old FanRust release must still build.
    - Re-check on a wgpu upgrade: every `?` / `return Err` in `present`
      after its `make_current(surface)` goes through the same release.
 
+8. **A zero byte after every text a GL debug call gets** (`mod.rs`
+   `zero_terminated` / `without_zero`, `command.rs` `add_marker` and
+   `begin_encoding`, `queue.rs` `to_debug_str` and the command buffer's
+   group in `submit`, `device.rs` `object_label`). `glPushDebugGroup`,
+   `glDebugMessageInsert` and `glObjectLabel` get the text's length, as GL
+   asks, but the Adreno 630 driver on a Samsung Galaxy S9 (Android 10)
+   copies it with `strlcpy`, which reads on to a zero byte whatever the
+   length. Rust text has none after it, so the copy ran past the label and
+   the app crashed in `strlcpy` under `libGLESv2_adreno.so` when it reached
+   unmapped memory (Play, Fantasia Painter 57, from `Queue::submit`). The
+   length passed is still the text's own; the zero byte only stops the
+   overread.
+   - Also: the shader label (`compile_shader`) now asks `DEBUG_FNS` like
+     every other label; upstream asked only `supports_debug`, so
+     `GlDebugFns::Disabled` still labelled shaders.
+   - Pinned by `command.rs` tests `marker_is_followed_by_a_zero_byte` and
+     `label_round_trips_with_a_zero_byte` (`cargo test -p wgpu-hal
+     --features gles --lib gles::`).
+   - Re-check on a wgpu upgrade: `grep -n "object_label\|push_debug_group\|debug_message_insert"`
+     in `src/gles/` — every call goes through `object_label` /
+     `add_marker` / `zero_terminated`.
+   - FanRust's store bundles also turn the debug calls off altogether
+     (`GlDebugFns::Disabled`, `imaging_wgpu::headless` STORE_BUILD); this
+     change covers the dev builds, which keep the names for GPU captures.
+
 ## Checking after any change here or a wgpu upgrade
 
 All run in FanRust, with its `[patch.crates-io]` pointing at the new commit.

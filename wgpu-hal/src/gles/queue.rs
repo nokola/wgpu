@@ -19,7 +19,9 @@ fn to_debug_str(s: &str) -> &str {
     // the string but some implementations will try to access the ptr even if the
     // length is 0.
     if s.is_empty() {
-        "<empty>"
+        // FanRust patch: with the zero byte after it, like every other text
+        // a debug call gets — see `super::zero_terminated`.
+        super::without_zero("<empty>\0")
     } else {
         s
     }
@@ -1987,7 +1989,7 @@ impl crate::Queue for super::Queue {
                         gl.push_debug_group(
                             glow::DEBUG_SOURCE_APPLICATION,
                             DEBUG_ID,
-                            to_debug_str(label),
+                            to_debug_str(super::without_zero(label)),
                         )
                     };
                 }

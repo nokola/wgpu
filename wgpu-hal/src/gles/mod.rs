@@ -1264,8 +1264,30 @@ enum Command {
     },
 }
 
+/// FanRust patch: `label` with a zero byte after it, for a GL debug call
+/// (`glPushDebugGroup`, `glObjectLabel`, ...). Those calls take a length,
+/// and wgpu passes the label's own, but some Adreno drivers copy the label
+/// with `strlcpy`, which reads until a zero byte whatever the length. A Rust
+/// string has none, so the copy ran on past the label and the app crashed
+/// in `strlcpy` under `libGLESv2_adreno.so` whenever it reached unmapped
+/// memory (Samsung Galaxy S9, Adreno 630, Android 10). The caller still
+/// passes the label's length, so the driver never sees the zero byte as
+/// text; `without_zero` gives the label back.
+fn zero_terminated(label: &str) -> String {
+    let mut terminated = String::with_capacity(label.len() + 1);
+    terminated.push_str(label);
+    terminated.push('\0');
+    terminated
+}
+
+/// FanRust patch: the label inside a `zero_terminated` string.
+fn without_zero(terminated: &str) -> &str {
+    terminated.strip_suffix('\0').unwrap_or(terminated)
+}
+
 #[derive(Default)]
 pub struct CommandBuffer {
+    /// FanRust patch: `zero_terminated`.
     label: Option<String>,
     commands: Vec<Command>,
     data_bytes: Vec<u8>,
@@ -1278,7 +1300,7 @@ impl fmt::Debug for CommandBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut builder = f.debug_struct("CommandBuffer");
         if let Some(ref label) = self.label {
-            builder.field("label", label);
+            builder.field("label", &without_zero(label));
         }
         builder.finish()
     }

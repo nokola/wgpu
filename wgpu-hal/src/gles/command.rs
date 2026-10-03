@@ -1,4 +1,3 @@
-use alloc::string::String;
 use core::{mem, ops::Range};
 
 use arrayvec::ArrayVec;
@@ -81,10 +80,14 @@ impl super::CommandBuffer {
         self.queries.clear();
     }
 
+    /// FanRust patch: a zero byte follows the marker in `data_bytes`, outside
+    /// the returned range — see `super::zero_terminated` for why.
     fn add_marker(&mut self, marker: &str) -> Range<u32> {
         let start = self.data_bytes.len() as u32;
         self.data_bytes.extend(marker.as_bytes());
-        start..self.data_bytes.len() as u32
+        let end = self.data_bytes.len() as u32;
+        self.data_bytes.push(0);
+        start..end
     }
 
     fn add_immediates_data(&mut self, data: &[u32]) -> Range<u32> {
@@ -305,7 +308,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
         self.state = State::default();
-        self.cmd_buffer.label = label.map(String::from);
+        self.cmd_buffer.label = label.map(super::zero_terminated);
         Ok(())
     }
     unsafe fn discard_encoding(&mut self) {
@@ -1401,5 +1404,30 @@ impl crate::CommandEncoder for super::CommandEncoder {
         _intersection_group_data: crate::PipelineGroupData<super::Buffer>,
     ) {
         unimplemented!()
+    }
+}
+
+/// FanRust patch: pins the zero byte after every debug text (see
+/// `super::zero_terminated`).
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn marker_is_followed_by_a_zero_byte() {
+        let mut buffer = super::super::CommandBuffer::default();
+        let first = buffer.add_marker("first pass");
+        let second = buffer.add_marker("");
+        let third = buffer.add_marker("third");
+        for (range, text) in [(first, "first pass"), (second, ""), (third, "third")] {
+            let bytes = &buffer.data_bytes[range.start as usize..range.end as usize];
+            assert_eq!(bytes, text.as_bytes());
+            assert_eq!(buffer.data_bytes[range.end as usize], 0);
+        }
+    }
+
+    #[test]
+    fn label_round_trips_with_a_zero_byte() {
+        let terminated = super::super::zero_terminated("canvas");
+        assert_eq!(terminated.as_bytes(), b"canvas\0");
+        assert_eq!(super::super::without_zero(&terminated), "canvas");
     }
 }

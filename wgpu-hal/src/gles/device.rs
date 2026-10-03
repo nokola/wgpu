@@ -23,6 +23,15 @@ type ShaderStage<'a> = (
 );
 type NameBindingMap = FastHashMap<String, (super::BindingRegister, u8)>;
 
+/// FanRust patch: `glObjectLabel` with a zero byte after the label — see
+/// `super::zero_terminated`. One small allocation per labelled object, only
+/// while DEBUG_FNS is on.
+#[cfg(native)]
+unsafe fn object_label(gl: &glow::Context, identifier: u32, name: u32, label: &str) {
+    let terminated = super::zero_terminated(label);
+    unsafe { gl.object_label(identifier, name, Some(super::without_zero(&terminated))) };
+}
+
 struct CompilationContext<'a> {
     layout: &'a super::PipelineLayout,
     sampler_map: &'a mut super::SamplerBindMap,
@@ -247,6 +256,7 @@ impl super::Device {
         shader: &str,
         naga_stage: naga::ShaderStage,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
+        #[cfg_attr(target_arch = "wasm32", allow(unused))] private_caps: PrivateCapabilities,
     ) -> Result<glow::Shader, crate::PipelineError> {
         let target = match naga_stage {
             naga::ShaderStage::Vertex => glow::VERTEX_SHADER,
@@ -261,10 +271,15 @@ impl super::Device {
         };
 
         let raw = unsafe { gl.create_shader(target) }.unwrap();
+        // FanRust patch: asks DEBUG_FNS like every other label (upstream
+        // asked only `supports_debug`, so `GlDebugFns::Disabled` still
+        // labelled shaders).
         #[cfg(native)]
-        if gl.supports_debug() {
-            let name = raw.0.get();
-            unsafe { gl.object_label(glow::SHADER, name, label) };
+        if let Some(label) = label {
+            if private_caps.contains(PrivateCapabilities::DEBUG_FNS) {
+                let name = raw.0.get();
+                unsafe { object_label(gl, glow::SHADER, name, label) };
+            }
         }
 
         unsafe { gl.shader_source(raw, shader) };
@@ -295,6 +310,7 @@ impl super::Device {
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         context: CompilationContext,
         program: glow::Program,
+        private_caps: PrivateCapabilities,
     ) -> Result<glow::Shader, crate::PipelineError> {
         let source = 'outer: {
             use naga::back::glsl;
@@ -392,7 +408,15 @@ impl super::Device {
             Cow::Owned(output)
         };
 
-        unsafe { Self::compile_shader(gl, &source, naga_stage, stage.module.label.as_deref()) }
+        unsafe {
+            Self::compile_shader(
+                gl,
+                &source,
+                naga_stage,
+                stage.module.label.as_deref(),
+                private_caps,
+            )
+        }
     }
 
     unsafe fn create_pipeline<'a>(
@@ -476,7 +500,7 @@ impl super::Device {
         if let Some(label) = label {
             if private_caps.contains(PrivateCapabilities::DEBUG_FNS) {
                 let name = program.0.get();
-                unsafe { gl.object_label(glow::PROGRAM, name, Some(label)) };
+                unsafe { object_label(gl, glow::PROGRAM, name, label) };
             }
         }
 
@@ -502,7 +526,8 @@ impl super::Device {
                 clip_distance_count: &mut clip_distance_count,
             };
 
-            let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
+            let shader =
+                Self::create_shader(gl, naga_stage, stage, context, program, private_caps)?;
             shaders_to_delete.push(shader);
         }
 
@@ -516,6 +541,7 @@ impl super::Device {
                     &shader_src,
                     naga::ShaderStage::Fragment,
                     Some("(wgpu internal) dummy fragment shader"),
+                    private_caps,
                 )
             }?;
             shaders_to_delete.push(shader);
@@ -724,7 +750,7 @@ impl crate::Device for super::Device {
                 .contains(PrivateCapabilities::DEBUG_FNS)
             {
                 let name = raw.map_or(0, |buf| buf.0.get());
-                unsafe { gl.object_label(glow::BUFFER, name, Some(label)) };
+                unsafe { object_label(gl, glow::BUFFER, name, label) };
             }
         }
 
@@ -914,7 +940,7 @@ impl crate::Device for super::Device {
                     .contains(PrivateCapabilities::DEBUG_FNS)
                 {
                     let name = raw.0.get();
-                    unsafe { gl.object_label(glow::RENDERBUFFER, name, Some(label)) };
+                    unsafe { object_label(gl, glow::RENDERBUFFER, name, label) };
                 }
             }
 
@@ -1082,7 +1108,7 @@ impl crate::Device for super::Device {
                     .contains(PrivateCapabilities::DEBUG_FNS)
                 {
                     let name = raw.0.get();
-                    unsafe { gl.object_label(glow::TEXTURE, name, Some(label)) };
+                    unsafe { object_label(gl, glow::TEXTURE, name, label) };
                 }
             }
 
@@ -1248,7 +1274,7 @@ impl crate::Device for super::Device {
                 .contains(PrivateCapabilities::DEBUG_FNS)
             {
                 let name = raw.0.get();
-                unsafe { gl.object_label(glow::SAMPLER, name, Some(label)) };
+                unsafe { object_label(gl, glow::SAMPLER, name, label) };
             }
         }
 
